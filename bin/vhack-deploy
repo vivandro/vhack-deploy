@@ -1,0 +1,408 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# vhack-deploy — CLI for deploying sites to vhackpad.com
+# Usage: vhack-deploy <command> [args]
+
+VERSION="1.0.0"
+DOMAIN="vhackpad.com"
+SSH_HOST="lightsail"
+SERVER_BASE="/var/www"
+SERVER_DEPLOY_DIR="/opt/vhack-deploy"
+REGISTRY="${SERVER_DEPLOY_DIR}/registry.json"
+WILDCARD_CERT_DIR="/etc/letsencrypt/live/vhackpad.com"
+MAX_RELEASES=3
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log()   { echo -e "${GREEN}▸${NC} $*"; }
+warn()  { echo -e "${YELLOW}▸${NC} $*"; }
+error() { echo -e "${RED}✗${NC} $*" >&2; }
+die()   { error "$@"; exit 1; }
+
+# ─── Auto-detection ──────────────────────────────────────────────────────────
+
+detect_type() {
+    local dir="${1:-.}"
+    if [[ -f "${dir}/Dockerfile" ]] || [[ -f "${dir}/docker-compose.yml" ]] || [[ -f "${dir}/docker-compose.yaml" ]]; then
+        echo "docker"
+    elif [[ -f "${dir}/pubspec.yaml" ]]; then
+        echo "flutter"
+    else
+        echo "static"
+    fi
+}
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+ssh_cmd() {
+    ssh -o ConnectTimeout=10 "${SSH_HOST}" "$@"
+}
+
+require_site_name() {
+    [[ -n "${1:-}" ]] || die "Usage: vhack-deploy $COMMAND <site-name>"
+    # Validate site name: lowercase alphanumeric + hyphens
+    [[ "$1" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$ ]] || \
+        die "Invalid site name '$1'. Use lowercase letters, numbers, and hyphens."
+    echo "$1"
+}
+
+timestamp() {
+    date +%Y%m%d_%H%M%S
+}
+
+# ─── Commands ────────────────────────────────────────────────────────────────
+
+cmd_init() {
+    local site
+    site=$(require_site_name "${1:-}")
+    local site_type="${2:-static}"
+    local port="${3:-}"
+    local url="https://${site}.${DOMAIN}"
+
+    if [[ "$site" == "vhackpad" ]]; then
+        url="https://${DOMAIN}"
+    fi
+
+    log "Initializing site: ${site} (type: ${site_type})"
+
+    # Validate type
+    case "$site_type" in
+        static|flutter|docker) ;;
+        *) die "Unknown site type: ${site_type}. Use: static, flutter, docker" ;;
+    esac
+
+    # For docker, need a port
+    if [[ "$site_type" == "docker" ]] && [[ -z "$port" ]]; then
+        # Auto-assign port starting from 3001
+        port=$(ssh_cmd "cat ${REGISTRY} 2>/dev/null | python3 -c \"
+import sys, json
+try:
+    reg = json.load(sys.stdin)
+    ports = [s.get('port', 0) for s in reg.get('sites', {}).values() if s.get('type') == 'docker']
+    print(max(ports + [3000]) + 1)
+except:
+    print(3001)
+\"")
+        log "Auto-assigned port: ${port}"
+    fi
+
+    # Choose nginx template
+    local nginx_template
+    case "$site_type" in
+        docker) nginx_template="nginx-docker.conf" ;;
+        *)      nginx_template="nginx-static.conf" ;;
+    esac
+
+    # Compute server_name for nginx
+    local server_name
+    if [[ "$site" == "vhackpad" ]]; then
+        server_name="${DOMAIN}"
+    else
+        server_name="${site}.${DOMAIN}"
+    fi
+
+    # Create directories and nginx config on server
+    ssh_cmd "sudo bash -s" <<REMOTE
+set -euo pipefail
+
+# Create directory structure
+mkdir -p ${SERVER_BASE}/${site}/{releases,shared}
+
+# Generate nginx config from template
+TEMPLATE=\$(cat ${SERVER_DEPLOY_DIR}/templates/${nginx_template})
+TEMPLATE=\${TEMPLATE//\{\{SUBDOMAIN\}\}/${site}}
+TEMPLATE=\${TEMPLATE//\{\{DOMAIN\}\}/${DOMAIN}}
+TEMPLATE=\${TEMPLATE//\{\{SERVER_NAME\}\}/${server_name}}
+TEMPLATE=\${TEMPLATE//\{\{PORT\}\}/${port:-3000}}
+
+echo "\${TEMPLATE}" > /etc/nginx/sites-available/${site}
+ln -sf /etc/nginx/sites-available/${site} /etc/nginx/sites-enabled/${site}
+
+# Test and reload nginx
+nginx -t
+systemctl reload nginx
+
+# Update registry
+${SERVER_DEPLOY_DIR}/bin/update-registry.py add "${site}" "${site_type}" "${port:-}"
+REMOTE
+
+    log "Site initialized: ${url}"
+    log "Deploy with: vhack-deploy push ${site}"
+}
+
+cmd_push() {
+    local site
+    site=$(require_site_name "${1:-}")
+    local site_type
+    site_type=$(detect_type ".")
+    local release
+    release=$(timestamp)
+    local release_dir="${SERVER_BASE}/${site}/releases/${release}"
+
+    log "Deploying ${site} (detected: ${site_type}, release: ${release})"
+
+    case "$site_type" in
+        flutter)
+            log "Building Flutter web..."
+            flutter build web --release
+            local src_dir="build/web"
+            ;;
+        docker)
+            local src_dir="."
+            ;;
+        static)
+            local src_dir="."
+            ;;
+    esac
+
+    # Create release directory (writable by deploy user for rsync)
+    ssh_cmd "sudo mkdir -p ${release_dir} && sudo chown \$(id -un):\$(id -gn) ${release_dir}"
+
+    # Sync files
+    log "Syncing files..."
+    rsync -az --delete \
+        --exclude '.git' \
+        --exclude 'node_modules' \
+        --exclude '.env' \
+        --exclude '.github' \
+        "${src_dir}/" "${SSH_HOST}:${release_dir}/"
+
+    if [[ "$site_type" == "docker" ]]; then
+        # Copy shared .env if it exists
+        ssh_cmd "test -f ${SERVER_BASE}/${site}/shared/.env && \
+            cp ${SERVER_BASE}/${site}/shared/.env ${release_dir}/.env || true"
+    fi
+
+    # Activate release on server
+    log "Activating release..."
+    ssh_cmd "sudo ${SERVER_DEPLOY_DIR}/bin/activate '${site}' '${release}' '${site_type}'"
+
+    # Health check
+    local url
+    if [[ "$site" == "vhackpad" ]]; then
+        url="https://${DOMAIN}"
+    else
+        url="https://${site}.${DOMAIN}"
+    fi
+
+    log "Running health check..."
+    local http_code
+    http_code=$(curl -so /dev/null -w '%{http_code}' --max-time 10 "${url}" 2>/dev/null || echo "000")
+
+    if [[ "$http_code" =~ ^(200|301|302|304)$ ]]; then
+        log "Deploy successful! ${url} (HTTP ${http_code})"
+    else
+        warn "Health check returned HTTP ${http_code} — consider rolling back with: vhack-deploy rollback ${site}"
+    fi
+}
+
+cmd_list() {
+    log "Sites on ${DOMAIN}:"
+    echo ""
+    ssh_cmd "cat ${REGISTRY}" | python3 -c "
+import sys, json
+reg = json.load(sys.stdin)
+sites = reg.get('sites', {})
+if not sites:
+    print('  (no sites)')
+    sys.exit(0)
+
+# Header
+print(f\"  {'NAME':<25} {'TYPE':<10} {'URL':<40} {'RELEASES':>8}\")
+print(f\"  {'─'*25} {'─'*10} {'─'*40} {'─'*8}\")
+
+for name, info in sorted(sites.items()):
+    stype = info.get('type', '?')
+    releases = info.get('release_count', 0)
+    if name == 'vhackpad':
+        url = 'https://${DOMAIN}'
+    else:
+        url = f'https://{name}.${DOMAIN}'
+    print(f'  {name:<25} {stype:<10} {url:<40} {releases:>8}')
+"
+    echo ""
+}
+
+cmd_rollback() {
+    local site
+    site=$(require_site_name "${1:-}")
+
+    log "Rolling back ${site}..."
+    ssh_cmd "sudo bash -s" <<REMOTE
+set -euo pipefail
+site_dir="${SERVER_BASE}/${site}"
+current_release=\$(readlink "\${site_dir}/current" | xargs basename)
+prev_release=\$(ls -1 "\${site_dir}/releases/" | sort -r | grep -v "\${current_release}" | head -1)
+
+if [[ -z "\${prev_release}" ]]; then
+    echo "No previous release to roll back to" >&2
+    exit 1
+fi
+
+echo "Rolling back from \${current_release} to \${prev_release}"
+
+# Get site type from registry
+site_type=\$(python3 -c "
+import json
+reg = json.load(open('${REGISTRY}'))
+print(reg['sites']['${site}']['type'])
+")
+
+${SERVER_DEPLOY_DIR}/bin/activate "${site}" "\${prev_release}" "\${site_type}"
+REMOTE
+
+    log "Rollback complete for ${site}"
+}
+
+cmd_logs() {
+    local site
+    site=$(require_site_name "${1:-}")
+    local lines="${2:-50}"
+
+    # Check if docker site
+    local site_type
+    site_type=$(ssh_cmd "python3 -c \"
+import json
+reg = json.load(open('${REGISTRY}'))
+print(reg['sites']['${site}']['type'])
+\"" 2>/dev/null || echo "static")
+
+    if [[ "$site_type" == "docker" ]]; then
+        log "Docker logs for ${site}:"
+        ssh_cmd "cd ${SERVER_BASE}/${site}/current && sudo docker compose logs --tail=${lines} -f"
+    else
+        log "Nginx access log for ${site}:"
+        ssh_cmd "sudo tail -${lines}f /var/log/nginx/${site}.access.log"
+    fi
+}
+
+cmd_destroy() {
+    local site
+    site=$(require_site_name "${1:-}")
+
+    warn "This will permanently delete ${site}.${DOMAIN} and all its data."
+    read -rp "Type the site name to confirm: " confirm
+    [[ "$confirm" == "$site" ]] || die "Aborted."
+
+    log "Destroying ${site}..."
+    ssh_cmd "sudo bash -s" <<REMOTE
+set -euo pipefail
+
+# Stop docker if running
+if [[ -f "${SERVER_BASE}/${site}/current/docker-compose.yml" ]] || \
+   [[ -f "${SERVER_BASE}/${site}/current/docker-compose.yaml" ]]; then
+    cd "${SERVER_BASE}/${site}/current"
+    docker compose down --remove-orphans 2>/dev/null || true
+fi
+
+# Remove nginx config
+rm -f /etc/nginx/sites-enabled/${site}
+rm -f /etc/nginx/sites-available/${site}
+nginx -t && systemctl reload nginx
+
+# Remove site directory
+rm -rf ${SERVER_BASE}/${site}
+
+# Remove log files
+rm -f /var/log/nginx/${site}.access.log
+rm -f /var/log/nginx/${site}.error.log
+
+# Update registry
+${SERVER_DEPLOY_DIR}/bin/update-registry.py remove "${site}"
+REMOTE
+
+    log "Destroyed ${site}"
+}
+
+cmd_disk() {
+    log "Disk usage:"
+    echo ""
+    ssh_cmd "bash -s" <<'REMOTE'
+echo "  Overall:"
+df -h / | tail -1 | awk '{printf "    Used: %s / %s (%s)\n", $3, $2, $5}'
+echo ""
+echo "  Per-site:"
+du -sh /var/www/*/  2>/dev/null | sort -rh | awk '{printf "    %-40s %s\n", $2, $1}'
+echo ""
+echo "  Docker:"
+sudo docker system df 2>/dev/null | tail -n +2 | awk '{printf "    %-20s %s\n", $1, $4}'
+REMOTE
+    echo ""
+}
+
+cmd_env() {
+    local site
+    site=$(require_site_name "${1:-}")
+    local action="${2:-show}"
+
+    case "$action" in
+        show)
+            ssh_cmd "cat ${SERVER_BASE}/${site}/shared/.env 2>/dev/null || echo '(no .env file)'"
+            ;;
+        edit)
+            log "Editing .env for ${site}..."
+            local tmpfile
+            tmpfile=$(mktemp)
+            ssh_cmd "cat ${SERVER_BASE}/${site}/shared/.env 2>/dev/null" > "$tmpfile" || true
+            ${EDITOR:-vi} "$tmpfile"
+            scp "$tmpfile" "${SSH_HOST}:/tmp/vhack-env-${site}"
+            ssh_cmd "sudo bash -c 'mkdir -p ${SERVER_BASE}/${site}/shared && mv /tmp/vhack-env-${site} ${SERVER_BASE}/${site}/shared/.env && chmod 600 ${SERVER_BASE}/${site}/shared/.env'"
+            rm -f "$tmpfile"
+            log "Updated .env for ${site}"
+            ;;
+        *)
+            die "Usage: vhack-deploy env <site> [show|edit]"
+            ;;
+    esac
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<EOF
+vhack-deploy v${VERSION} — Deploy sites to ${DOMAIN}
+
+Usage: vhack-deploy <command> [args]
+
+Commands:
+  init <site> [type] [port]   Initialize a new site (type: static|flutter|docker)
+  push <site>                 Deploy current directory to site
+  list                        List all sites
+  rollback <site>             Revert to previous release
+  logs <site> [lines]         Tail site logs
+  destroy <site>              Remove site completely
+  disk                        Show disk usage
+  env <site> [show|edit]      Manage site environment variables
+
+Examples:
+  vhack-deploy init my-app              # New static site
+  vhack-deploy init my-api docker       # New dockerized site
+  vhack-deploy push my-app              # Deploy current directory
+  vhack-deploy rollback my-app          # Revert to previous release
+EOF
+}
+
+COMMAND="${1:-}"
+shift || true
+
+case "$COMMAND" in
+    init)       cmd_init "$@" ;;
+    push)       cmd_push "$@" ;;
+    list)       cmd_list "$@" ;;
+    rollback)   cmd_rollback "$@" ;;
+    logs)       cmd_logs "$@" ;;
+    destroy)    cmd_destroy "$@" ;;
+    disk)       cmd_disk "$@" ;;
+    env)        cmd_env "$@" ;;
+    version|-v|--version)
+        echo "vhack-deploy v${VERSION}" ;;
+    help|-h|--help|"")
+        usage ;;
+    *)
+        die "Unknown command: ${COMMAND}. Run 'vhack-deploy help' for usage." ;;
+esac

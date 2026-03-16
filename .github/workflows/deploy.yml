@@ -1,0 +1,113 @@
+name: Deploy to vhackpad.com
+
+on:
+  workflow_call:
+    inputs:
+      site:
+        required: true
+        type: string
+        description: "Site name (subdomain)"
+      type:
+        required: false
+        type: string
+        default: "auto"
+        description: "Site type: static, flutter, docker, or auto (auto-detect)"
+    secrets:
+      DEPLOY_SSH_KEY:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          cat >> ~/.ssh/config <<'EOF'
+          Host lightsail
+            HostName 3.109.44.216
+            User ubuntu
+            IdentityFile ~/.ssh/deploy_key
+            StrictHostKeyChecking no
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Detect site type
+        id: detect
+        run: |
+          TYPE="${{ inputs.type }}"
+          if [[ "$TYPE" == "auto" ]]; then
+            if [[ -f "Dockerfile" ]] || [[ -f "docker-compose.yml" ]] || [[ -f "docker-compose.yaml" ]]; then
+              TYPE="docker"
+            elif [[ -f "pubspec.yaml" ]]; then
+              TYPE="flutter"
+            else
+              TYPE="static"
+            fi
+          fi
+          echo "type=${TYPE}" >> "$GITHUB_OUTPUT"
+          echo "Detected type: ${TYPE}"
+
+      - name: Setup Flutter
+        if: steps.detect.outputs.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Build Flutter web
+        if: steps.detect.outputs.type == 'flutter'
+        run: flutter build web --release
+
+      - name: Deploy
+        run: |
+          SITE="${{ inputs.site }}"
+          TYPE="${{ steps.detect.outputs.type }}"
+          RELEASE=$(date +%Y%m%d_%H%M%S)
+          RELEASE_DIR="/var/www/${SITE}/releases/${RELEASE}"
+
+          # Determine source directory
+          if [[ "$TYPE" == "flutter" ]]; then
+            SRC_DIR="build/web"
+          else
+            SRC_DIR="."
+          fi
+
+          # Create release directory (writable by deploy user for rsync)
+          ssh lightsail "sudo mkdir -p ${RELEASE_DIR} && sudo chown ubuntu:ubuntu ${RELEASE_DIR}"
+
+          # Sync files
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude 'node_modules' \
+            --exclude '.env' \
+            --exclude '.github' \
+            "${SRC_DIR}/" "lightsail:${RELEASE_DIR}/"
+
+          # Copy shared .env for docker sites
+          if [[ "$TYPE" == "docker" ]]; then
+            ssh lightsail "test -f /var/www/${SITE}/shared/.env && \
+              sudo cp /var/www/${SITE}/shared/.env ${RELEASE_DIR}/.env || true"
+          fi
+
+          # Activate release
+          ssh lightsail "sudo /opt/vhack-deploy/bin/activate '${SITE}' '${RELEASE}' '${TYPE}'"
+
+          echo "Deployed ${SITE} (${TYPE}) release ${RELEASE}"
+
+      - name: Health check
+        run: |
+          SITE="${{ inputs.site }}"
+          if [[ "$SITE" == "vhackpad" ]]; then
+            URL="https://vhackpad.com"
+          else
+            URL="https://${SITE}.vhackpad.com"
+          fi
+          HTTP_CODE=$(curl -so /dev/null -w '%{http_code}' --max-time 15 "${URL}" || echo "000")
+          echo "Health check: ${URL} → HTTP ${HTTP_CODE}"
+          if [[ ! "$HTTP_CODE" =~ ^(200|301|302|304)$ ]]; then
+            echo "::warning::Health check returned HTTP ${HTTP_CODE}"
+          fi
