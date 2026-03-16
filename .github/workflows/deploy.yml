@@ -27,13 +27,14 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          cat >> ~/.ssh/config <<EOF
+          cat >> ~/.ssh/config <<'EOF'
           Host lightsail
             HostName 3.109.44.216
             User ubuntu
             IdentityFile ~/.ssh/deploy_key
             StrictHostKeyChecking no
           EOF
+          chmod 600 ~/.ssh/config
 
       - name: Detect site type
         id: detect
@@ -75,14 +76,15 @@ jobs:
             SRC_DIR="."
           fi
 
-          # Create release directory
-          ssh lightsail "sudo mkdir -p ${RELEASE_DIR}"
+          # Create release directory (writable by deploy user for rsync)
+          ssh lightsail "sudo mkdir -p ${RELEASE_DIR} && sudo chown ubuntu:ubuntu ${RELEASE_DIR}"
 
           # Sync files
           rsync -az --delete \
             --exclude '.git' \
             --exclude 'node_modules' \
             --exclude '.env' \
+            --exclude '.github' \
             "${SRC_DIR}/" "lightsail:${RELEASE_DIR}/"
 
           # Copy shared .env for docker sites

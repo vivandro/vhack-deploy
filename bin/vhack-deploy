@@ -17,7 +17,6 @@ MAX_RELEASES=3
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 NC='\033[0m'
 
 log()   { echo -e "${GREEN}▸${NC} $*"; }
@@ -99,6 +98,14 @@ except:
         *)      nginx_template="nginx-static.conf" ;;
     esac
 
+    # Compute server_name for nginx
+    local server_name
+    if [[ "$site" == "vhackpad" ]]; then
+        server_name="${DOMAIN}"
+    else
+        server_name="${site}.${DOMAIN}"
+    fi
+
     # Create directories and nginx config on server
     ssh_cmd "sudo bash -s" <<REMOTE
 set -euo pipefail
@@ -110,6 +117,7 @@ mkdir -p ${SERVER_BASE}/${site}/{releases,shared}
 TEMPLATE=\$(cat ${SERVER_DEPLOY_DIR}/templates/${nginx_template})
 TEMPLATE=\${TEMPLATE//\{\{SUBDOMAIN\}\}/${site}}
 TEMPLATE=\${TEMPLATE//\{\{DOMAIN\}\}/${DOMAIN}}
+TEMPLATE=\${TEMPLATE//\{\{SERVER_NAME\}\}/${server_name}}
 TEMPLATE=\${TEMPLATE//\{\{PORT\}\}/${port:-3000}}
 
 echo "\${TEMPLATE}" > /etc/nginx/sites-available/${site}
@@ -152,23 +160,22 @@ cmd_push() {
             ;;
     esac
 
-    if [[ "$site_type" == "docker" ]]; then
-        # For docker: rsync project files, then activate (which does docker compose up)
-        log "Syncing project files..."
-        rsync -az --delete \
-            --exclude '.git' \
-            --exclude 'node_modules' \
-            --exclude '.env' \
-            "${src_dir}/" "${SSH_HOST}:${release_dir}/"
+    # Create release directory (writable by deploy user for rsync)
+    ssh_cmd "sudo mkdir -p ${release_dir} && sudo chown \$(id -un):\$(id -gn) ${release_dir}"
 
+    # Sync files
+    log "Syncing files..."
+    rsync -az --delete \
+        --exclude '.git' \
+        --exclude 'node_modules' \
+        --exclude '.env' \
+        --exclude '.github' \
+        "${src_dir}/" "${SSH_HOST}:${release_dir}/"
+
+    if [[ "$site_type" == "docker" ]]; then
         # Copy shared .env if it exists
         ssh_cmd "test -f ${SERVER_BASE}/${site}/shared/.env && \
             cp ${SERVER_BASE}/${site}/shared/.env ${release_dir}/.env || true"
-    else
-        # For static/flutter: rsync built files
-        log "Syncing files..."
-        ssh_cmd "mkdir -p ${release_dir}"
-        rsync -az --delete "${src_dir}/" "${SSH_HOST}:${release_dir}/"
     fi
 
     # Activate release on server
