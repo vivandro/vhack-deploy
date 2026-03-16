@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# activate — Server-side release activation
+# Called by both vhack-deploy CLI and GitHub Actions
+# Usage: activate <site> <release> <type>
+
+SITE="$1"
+RELEASE="$2"
+TYPE="$3"
+SERVER_BASE="/var/www"
+DEPLOY_DIR="/opt/vhack-deploy"
+REGISTRY="${DEPLOY_DIR}/registry.json"
+MAX_RELEASES=3
+
+SITE_DIR="${SERVER_BASE}/${SITE}"
+RELEASE_DIR="${SITE_DIR}/releases/${RELEASE}"
+
+[[ -d "$RELEASE_DIR" ]] || { echo "Release directory not found: ${RELEASE_DIR}" >&2; exit 1; }
+
+# If docker, stop the current container before switching
+if [[ "$TYPE" == "docker" ]]; then
+    if [[ -L "${SITE_DIR}/current" ]] && [[ -f "${SITE_DIR}/current/docker-compose.yml" || -f "${SITE_DIR}/current/docker-compose.yaml" ]]; then
+        echo "Stopping current docker containers..."
+        cd "${SITE_DIR}/current"
+        docker compose down --remove-orphans 2>/dev/null || true
+    fi
+fi
+
+# Atomic symlink swap
+ln -sfn "${RELEASE_DIR}" "${SITE_DIR}/current.tmp"
+mv -Tf "${SITE_DIR}/current.tmp" "${SITE_DIR}/current"
+
+echo "Activated: ${SITE} → ${RELEASE}"
+
+# Start docker containers for new release
+if [[ "$TYPE" == "docker" ]]; then
+    echo "Starting docker containers..."
+    cd "${SITE_DIR}/current"
+    docker compose up -d --build
+fi
+
+# Reload nginx (picks up any symlink changes for static sites)
+nginx -t && systemctl reload nginx
+
+# Prune old releases (keep MAX_RELEASES)
+CURRENT_RELEASE=$(readlink "${SITE_DIR}/current" | xargs basename)
+RELEASES=($(ls -1 "${SITE_DIR}/releases/" | sort -r))
+COUNT=0
+for rel in "${RELEASES[@]}"; do
+    COUNT=$((COUNT + 1))
+    if [[ "$COUNT" -gt "$MAX_RELEASES" ]] && [[ "$rel" != "$CURRENT_RELEASE" ]]; then
+        echo "Pruning old release: ${rel}"
+        rm -rf "${SITE_DIR}/releases/${rel}"
+    fi
+done
+
+# Update registry
+RELEASE_COUNT=$(ls -1 "${SITE_DIR}/releases/" | wc -l | tr -d ' ')
+${DEPLOY_DIR}/bin/update-registry.py update "${SITE}" release_count "${RELEASE_COUNT}" current_release "${CURRENT_RELEASE}"
+
+echo "Done."
