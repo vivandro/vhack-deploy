@@ -18,7 +18,7 @@ on:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -27,14 +27,13 @@ jobs:
           SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
         run: |
           mkdir -p ~/.ssh
-          eval $(ssh-agent -s)
-          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
-          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
-          printf '%s\n' "$SSH_KEY" | ssh-add -
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
           cat >> ~/.ssh/config <<'EOF'
           Host lightsail
             HostName 3.109.44.216
             User ubuntu
+            IdentityFile ~/.ssh/deploy_key
             StrictHostKeyChecking no
           EOF
           chmod 600 ~/.ssh/config
