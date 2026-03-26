@@ -22,18 +22,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup SSH
-        env:
-          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Configure SSH host
         run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
           cat >> ~/.ssh/config <<'EOF'
           Host lightsail
             HostName 3.109.44.216
             User ubuntu
-            IdentityFile ~/.ssh/deploy_key
             StrictHostKeyChecking no
           EOF
           chmod 600 ~/.ssh/config
