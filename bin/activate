@@ -40,6 +40,12 @@ if [[ "$TYPE" == "docker" ]]; then
     docker compose up -d --build
 fi
 
+# Run post-deploy hooks if they exist
+if [[ -f "${SITE_DIR}/hooks/post-deploy.sh" ]]; then
+    echo "Running post-deploy hooks..."
+    bash "${SITE_DIR}/hooks/post-deploy.sh"
+fi
+
 # Reload nginx (picks up any symlink changes for static sites)
 nginx -t && systemctl reload nginx
 
