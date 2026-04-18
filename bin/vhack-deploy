@@ -55,6 +55,124 @@ timestamp() {
     date +%Y%m%d_%H%M%S
 }
 
+# ─── Manifest deploy-gate (ADR_COURSE_LIFECYCLE.md §11.3) ────────────────────
+#
+# Pedagogy-platforms ship per-syllabus manifest.json files generated from the
+# content tree. Before pushing to prod, we verify each manifest has been
+# approved on me.vhackpad.com (status ∈ {approved, active}). Missing approval
+# blocks the deploy so drift never reaches a live cohort.
+#
+# Env:
+#   ME_API_URL     — defaults to https://me.vhackpad.com/api
+#   ME_API_KEY     — required to authenticate the gate query; unset = skip gate
+#                    (dev-friendly; in prod, set this or the gate is useless).
+#   SKIP_MANIFEST_GATE=1 — emergency override. Flagged loudly.
+
+ME_API_URL="${ME_API_URL:-https://me.vhackpad.com/api}"
+ME_API_KEY="${ME_API_KEY:-}"
+
+# Discover manifests: every <dir>/manifest.json under the current source tree.
+discover_manifests() {
+    local root="${1:-.}"
+    # Depth limit: courses live at <root>/<syllabus_id>/manifest.json, one level deep.
+    find "$root" -mindepth 2 -maxdepth 2 -name manifest.json \
+        -not -path '*/node_modules/*' \
+        -not -path '*/vendor/*' \
+        -not -path '*/.git/*' \
+        2>/dev/null || true
+}
+
+# Fetch a syllabus status from me. Emits stdout: "status|error-message".
+fetch_syllabus_status() {
+    local syllabus_id="$1"
+    local version="$2"
+    local url="${ME_API_URL}/syllabi/${syllabus_id}/${version}"
+    local http_code body
+    local tmp
+    tmp=$(mktemp)
+    http_code=$(curl -s -o "$tmp" -w '%{http_code}' \
+        -H "Authorization: Bearer ${ME_API_KEY}" \
+        --max-time 15 "$url" 2>/dev/null || echo '000')
+    body=$(cat "$tmp"); rm -f "$tmp"
+    if [[ "$http_code" == "200" ]]; then
+        python3 -c "import sys,json; d=json.loads(sys.argv[1]); print(d.get('syllabus',{}).get('status','unknown'))" "$body"
+    elif [[ "$http_code" == "404" ]]; then
+        echo "not-found"
+    else
+        echo "error:http=${http_code}"
+    fi
+}
+
+# POST a manifest to me as proposed (used by --preview).
+post_manifest_proposal() {
+    local manifest_path="$1"
+    local preview_url="$2"
+    local http_code body
+    local tmp
+    tmp=$(mktemp)
+    http_code=$(curl -s -o "$tmp" -w '%{http_code}' \
+        -H "Authorization: Bearer ${ME_API_KEY}" \
+        -H "X-Preview-URL: ${preview_url}" \
+        -H 'Content-Type: application/json' \
+        --max-time 30 \
+        --data-binary "@${manifest_path}" \
+        "${ME_API_URL}/admin/manifests" 2>/dev/null || echo '000')
+    body=$(cat "$tmp"); rm -f "$tmp"
+    if [[ "$http_code" != "200" ]]; then
+        error "manifest upload failed: HTTP ${http_code}"
+        [[ -n "$body" ]] && echo "  $body" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Verify every manifest in the source tree has an approvable status on me.
+# Returns 0 if all pass, non-zero on first blocker. Logs each check.
+verify_manifests_for_prod() {
+    local site="$1"
+    local manifests
+    manifests=$(discover_manifests ".")
+    [[ -z "$manifests" ]] && return 0  # Not a pedagogy-platform, no gate needed.
+
+    if [[ "${SKIP_MANIFEST_GATE:-}" == "1" ]]; then
+        warn "SKIP_MANIFEST_GATE=1 — bypassing deploy-gate. This disables the ADR §11.3 approval check."
+        return 0
+    fi
+    if [[ -z "$ME_API_KEY" ]]; then
+        error "ME_API_KEY is not set but pedagogy-platform manifests were found."
+        error "The gate fails closed: set ME_API_KEY, or export SKIP_MANIFEST_GATE=1 explicitly"
+        error "to bypass (ADR §11.3). Silently skipping enforcement is not allowed."
+        return 1
+    fi
+
+    log "Manifest deploy-gate: verifying approval status on ${ME_API_URL}..."
+    local blocker=""
+    while IFS= read -r mpath; do
+        local syllabus_id version status
+        syllabus_id=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['syllabus_id'])" "$mpath")
+        version=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['syllabus_version'])" "$mpath")
+        status=$(fetch_syllabus_status "$syllabus_id" "$version")
+        case "$status" in
+            approved|active)
+                log "  ✓ ${syllabus_id} v${version} (status=${status})"
+                ;;
+            not-found)
+                error "  ✗ ${syllabus_id} v${version} not registered on me"
+                error "    Run: vhack-deploy push --preview ${site}"
+                error "    Then have an admin approve the proposal before retrying."
+                blocker="1"
+                ;;
+            *)
+                error "  ✗ ${syllabus_id} v${version} blocked (status=${status})"
+                error "    Active and approved versions are allowed in prod."
+                blocker="1"
+                ;;
+        esac
+    done <<< "$manifests"
+
+    [[ -z "$blocker" ]]
+}
+
 # ─── Commands ────────────────────────────────────────────────────────────────
 
 cmd_init() {
@@ -136,6 +254,16 @@ REMOTE
 }
 
 cmd_push() {
+    # Parse optional --preview flag
+    local preview_mode=0
+    while [[ "${1:-}" == --* ]]; do
+        case "$1" in
+            --preview) preview_mode=1; shift ;;
+            --) shift; break ;;
+            *) die "Unknown flag: $1" ;;
+        esac
+    done
+
     local site
     site=$(require_site_name "${1:-}")
     local site_type
@@ -144,7 +272,16 @@ cmd_push() {
     release=$(timestamp)
     local release_dir="${SERVER_BASE}/${site}/releases/${release}"
 
-    log "Deploying ${site} (detected: ${site_type}, release: ${release})"
+    log "Deploying ${site} (detected: ${site_type}, release: ${release}${preview_mode:+, preview})"
+
+    # Preview mode: POST each manifest to me as a proposal, do NOT rsync to prod.
+    # Prod mode: verify each manifest has status ∈ {approved, active} on me.
+    if [[ "$preview_mode" == "1" ]]; then
+        cmd_push_preview "$site"
+        return
+    else
+        verify_manifests_for_prod "$site" || die "Deploy blocked by manifest gate. See above."
+    fi
 
     case "$site_type" in
         flutter)
@@ -199,6 +336,36 @@ cmd_push() {
     else
         warn "Health check returned HTTP ${http_code} — consider rolling back with: vhack-deploy rollback ${site}"
     fi
+}
+
+# Preview flow: discover manifests, POST each to me as a proposal.
+# Does NOT deploy to prod. Used by Content Authors to submit a manifest for
+# admin approval before running prod `vhack-deploy push`.
+cmd_push_preview() {
+    local site="$1"
+    if [[ -z "$ME_API_KEY" ]]; then
+        die "ME_API_KEY must be set to push manifest proposals to me."
+    fi
+    local manifests
+    manifests=$(discover_manifests ".")
+    [[ -z "$manifests" ]] && die "No manifests found under ./<syllabus_id>/manifest.json — nothing to preview."
+
+    log "Preview mode: posting manifest proposals to ${ME_API_URL}/admin/manifests"
+    local any_failed=""
+    while IFS= read -r mpath; do
+        local syllabus_id version preview_url
+        syllabus_id=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['syllabus_id'])" "$mpath")
+        version=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['syllabus_version'])" "$mpath")
+        preview_url="https://${site}.${DOMAIN}/${syllabus_id}/"
+        log "  ↑ ${syllabus_id} v${version} (preview=${preview_url})"
+        post_manifest_proposal "$mpath" "$preview_url" || any_failed="1"
+    done <<< "$manifests"
+
+    if [[ -n "$any_failed" ]]; then
+        die "One or more manifests failed to upload. See errors above."
+    fi
+    log "Preview complete. Have an admin approve via me's admin UI, then run:"
+    log "  vhack-deploy push ${site}"
 }
 
 cmd_list() {
@@ -371,7 +538,9 @@ Usage: vhack-deploy <command> [args]
 
 Commands:
   init <site> [type] [port]   Initialize a new site (type: static|flutter|docker)
-  push <site>                 Deploy current directory to site
+  push [--preview] <site>     Deploy current directory to site.
+                              --preview posts each <syllabus_id>/manifest.json
+                              to me as a proposal (no prod rsync).
   list                        List all sites
   rollback <site>             Revert to previous release
   logs <site> [lines]         Tail site logs
@@ -379,10 +548,17 @@ Commands:
   disk                        Show disk usage
   env <site> [show|edit]      Manage site environment variables
 
+Pedagogy-platform deploy gate (ADR_COURSE_LIFECYCLE.md §11.3):
+  When the source tree contains <syllabus_id>/manifest.json files, prod push
+  verifies each has status ∈ {approved, active} on ME_API_URL. Missing
+  approvals block the deploy. Use --preview to submit the proposal first.
+  ME_API_KEY must be set; SKIP_MANIFEST_GATE=1 is an emergency override.
+
 Examples:
   vhack-deploy init my-app              # New static site
   vhack-deploy init my-api docker       # New dockerized site
   vhack-deploy push my-app              # Deploy current directory
+  vhack-deploy push --preview python-prep  # Submit manifests for approval
   vhack-deploy rollback my-app          # Revert to previous release
 EOF
 }
