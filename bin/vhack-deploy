@@ -139,9 +139,10 @@ verify_manifests_for_prod() {
         return 0
     fi
     if [[ -z "$ME_API_KEY" ]]; then
-        warn "ME_API_KEY not set — skipping manifest deploy-gate."
-        warn "  Set ME_API_KEY to enforce per ADR_COURSE_LIFECYCLE.md §11.3."
-        return 0
+        error "ME_API_KEY is not set but pedagogy-platform manifests were found."
+        error "The gate fails closed: set ME_API_KEY, or export SKIP_MANIFEST_GATE=1 explicitly"
+        error "to bypass (ADR §11.3). Silently skipping enforcement is not allowed."
+        return 1
     fi
 
     log "Manifest deploy-gate: verifying approval status on ${ME_API_URL}..."

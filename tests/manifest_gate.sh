@@ -71,14 +71,20 @@ else
     fail "override did not warn. Output: $output"
 fi
 
-hdr "verify_manifests_for_prod: missing ME_API_KEY warns and passes"
+hdr "verify_manifests_for_prod: missing ME_API_KEY FAILS CLOSED"
 pushd "$SCRATCH/case4" >/dev/null
-ME_API_KEY="" output=$(ME_API_KEY="" verify_manifests_for_prod "python-prep" 2>&1)
+# Fail-closed: when manifests exist and ME_API_KEY is missing, the gate
+# must return non-zero so deploy aborts. Bypass requires explicit
+# SKIP_MANIFEST_GATE=1 per the review-panel's cycle-1 CONCERN.
+set +e
+output=$(ME_API_KEY="" verify_manifests_for_prod "python-prep" 2>&1)
+rc=$?
+set -e
 popd >/dev/null
-if [[ "$output" == *"ME_API_KEY not set"* ]]; then
-    pass "missing API key warns (dev-friendly)"
+if [[ "$rc" -ne 0 ]] && [[ "$output" == *"ME_API_KEY is not set"* ]]; then
+    pass "missing API key fails closed"
 else
-    fail "missing API key did not warn. Output: $output"
+    fail "missing API key did not fail closed. rc=$rc output=$output"
 fi
 
 # ─── Done ────────────────────────────────────────────────────────────────────
